@@ -94,6 +94,7 @@ Hard rules:
 - Reuse the existing branch work instead of re-implementing it:
   - `add-openai-provider`
   - `add-deepseekv4-provider`
+- This repository does not require a `codex/*` or `codex-*` branch name prefix. Work on the current project branch unless the user explicitly asks you to create or switch branches.
 - Do not delete, overwrite, or silently collapse those branches. Mine them for proven logic and port only the pieces required by the protocol plan.
 - Preserve successful existing behavior first. New protocol support must not regress the current Gemini/GLM flow on `master`.
 

@@ -616,3 +616,17 @@
   - 将适配层拆到 `app/extensions/llm_protocols/` 下，`app/extensions/llm_adapter.py` 只保留薄路由入口，便于后续继续扩展协议家族和 preset。
   - GitHub Actions 和本地启动时都会输出包含 protocol、preset、model、base URL 和脱敏 Epic 邮箱的 runtime summary，便于明天按不同平台逐项测试。
   - 主 README、workflow 文档、`.env.example` 和新的 provider 文档已经统一改为围绕协议家族与 preset 的说明方式，并补充官方文档入口，方便用户和初学者继续学习不同 LLM API 的协议差异。
+
+### 2026-05-09 澄清当前仓库不要求 codex 分支名前缀
+
+- 现象：
+  - 旧开发记录里仍然出现 `codex/...` 形式的历史分支名，容易让后续代理误以为当前仓库要求新分支必须使用 `codex/*` 或 `codex-*` 前缀。
+  - 用户当前希望直接在本项目当前分支内继续开发，不再被默认前缀或额外切分支流程干扰。
+- 根因判断：
+  - 仓库级 `AGENTS.md` 之前没有把“是否需要 `codex` 前缀”写成显式规则，导致历史分支名和客户端默认占位提示容易被误读成现行开发要求。
+- 改动文件：
+  - `AGENTS.md`
+  - `docs/maintenance-log.md`
+- 处理结果：
+  - 在仓库级 `AGENTS.md` 中明确说明：本仓库不要求 `codex/*` 或 `codex-*` 分支名前缀，默认直接在当前项目分支工作，除非用户明确要求创建或切换分支。
+  - 将旧日志中的 `codex/...` 视为历史分支命名记录，不再作为当前开发流约束。
