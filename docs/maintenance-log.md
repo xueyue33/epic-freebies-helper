@@ -751,3 +751,20 @@
   - 即时结账末尾增加 promotion 级 reconciliation：可回到商品页重新确认，并额外轮询订单历史，降低“实际已领到但最后没收好”的误报率。
   - `collect_weekly_games()` 会在真正抛错前，再对所有未确认 promotion 统一执行一轮最终 reconciliation，尽量把第二单的延迟成功补收回来。
   - 本地验证限制：未执行测试；已执行 `python3 -m py_compile app/services/epic_games_service.py` 与 `git diff --check` 做静态校验。
+
+### 2026-07-10 更新 BrowserForge 运行时数据依赖
+
+- 现象：
+  - 部分 fork 的 GitHub Actions 在进入 Epic 登录前就失败。
+  - 日志显示 `camoufox` 导入 `browserforge` 时尝试读取 `browserforge/headers/data/headers-order.json`，但当前锁定的 `browserforge 1.2.3` wheel 中没有该运行时数据文件。
+- 根因判断：
+  - `uv.lock` 仍锁定 `browserforge 1.2.3`。
+  - `browserforge 1.2.4` 已将模型 / 指纹数据改为通过 `apify-fingerprint-datapoints` 依赖提供，不再依赖旧的包内 `headers-order.json` 路径。
+- 改动文件：
+  - `pyproject.toml`
+  - `uv.lock`
+  - `docs/maintenance-log.md`
+- 处理结果：
+  - 在项目依赖中显式增加 `browserforge>=1.2.4`，避免后续重新锁定到缺少运行时数据文件的版本。
+  - 刷新 `uv.lock`，将 `browserforge` 从 `1.2.3` 更新到 `1.2.4`，并锁定新增的 `apify-fingerprint-datapoints` 传递依赖。
+  - 本地验证：`from browserforge.headers import HeaderGenerator`、`from browserforge.fingerprints import FingerprintGenerator`、`from camoufox import AsyncCamoufox` 均可正常导入。
