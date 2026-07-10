@@ -10,6 +10,9 @@ on:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+permissions:
+  contents: write
+
 jobs:
   epic-gamer:
     runs-on: ubuntu-latest
@@ -26,6 +29,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Sync upstream
+        continue-on-error: true
         run: |
           git remote add upstream https://github.com/Ronchy2000/epic-freebies-helper.git 2>/dev/null || true
           git fetch upstream master
