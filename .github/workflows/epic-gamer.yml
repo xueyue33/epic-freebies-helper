@@ -21,6 +21,23 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync upstream
+        run: |
+          git remote add upstream https://github.com/Ronchy2000/epic-freebies-helper.git 2>/dev/null || true
+          git fetch upstream master
+          if [ "$(git rev-list HEAD..upstream/master --count)" -gt 0 ]; then
+            echo "🔄 Merging $(git rev-list HEAD..upstream/master --count) upstream commits..."
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git merge upstream/master --no-edit
+            git push origin master
+          else
+            echo "✅ Already up to date with upstream."
+          fi
 
       - name: Install uv
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
