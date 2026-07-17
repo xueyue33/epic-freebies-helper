@@ -1,10 +1,17 @@
+import asyncio
 from types import SimpleNamespace
 
 import cv2
 import numpy as np
 from hcaptcha_challenger.models import PointCoordinate, SpatialPath
 
-from extensions.hcaptcha_adapter import _correct_drag_source_points, _detect_task_canvas_origin
+from extensions.hcaptcha_adapter import (
+    _correct_drag_source_points,
+    _decode_entity_contour,
+    _detect_task_canvas_origin,
+    _match_outline_contours,
+    _queue_empty_checkcaptcha_response,
+)
 
 
 def _write_challenge_screenshot(path, *, canvas_y: int, canvas_height: int):
@@ -82,3 +89,56 @@ def test_source_correction_requires_one_entity_per_model_path(tmp_path):
         (800, 300),
         (800, 450),
     ]
+
+
+def _contour_from_mask(mask):
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    return max(contours, key=cv2.contourArea)
+
+
+def test_outline_topology_matching_ignores_candidate_position():
+    square = np.zeros((80, 80), dtype=np.uint8)
+    cv2.rectangle(square, (15, 15), (55, 55), 255, -1)
+    triangle = np.zeros((80, 80), dtype=np.uint8)
+    cv2.fillPoly(triangle, [np.array([[40, 10], [70, 65], [10, 65]])], 255)
+    source_contours = [_contour_from_mask(square), _contour_from_mask(triangle)]
+    targets = [
+        (_contour_from_mask(triangle), (100.0, 100.0)),
+        (_contour_from_mask(square), (200.0, 200.0)),
+    ]
+
+    matched = _match_outline_contours(source_contours, targets)
+
+    assert matched is not None
+    assert matched[0] == [1, 0]
+
+
+def test_entity_contour_uses_png_alpha_channel():
+    image = np.zeros((40, 40, 4), dtype=np.uint8)
+    cv2.circle(image, (20, 20), 10, (100, 150, 200, 255), -1)
+    encoded, content = cv2.imencode(".png", image)
+
+    contour = _decode_entity_contour(content.tobytes())
+
+    assert encoded
+    assert contour is not None
+    assert cv2.contourArea(contour) > 250
+
+
+def test_empty_checkcaptcha_response_is_queued_as_failure():
+    class Response:
+        url = "https://api.hcaptcha.com/checkcaptcha/example"
+        status = 200
+
+        @staticmethod
+        async def body():
+            return b""
+
+    agent = SimpleNamespace(_captcha_response_queue=asyncio.Queue())
+
+    handled = asyncio.run(_queue_empty_checkcaptcha_response(agent, Response()))
+    queued = agent._captcha_response_queue.get_nowait()
+
+    assert handled is True
+    assert queued.is_pass is False
+    assert queued.error == "empty_checkcaptcha_response"

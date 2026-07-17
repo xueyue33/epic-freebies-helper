@@ -181,9 +181,6 @@ class EpicSettings(AgentConfig):
 
 
 settings = EpicSettings()
-settings.ignore_request_questions = [
-    "Please drag the crossing to complete the lines",
-    "Please drag the segment on the right to complete the line",
-]
+settings.ignore_request_questions = ["Please drag the crossing to complete the lines"]
 apply_llm_patch(settings)
 apply_hcaptcha_drag_patch()

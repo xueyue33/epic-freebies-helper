@@ -370,8 +370,9 @@ class EpicAuthorization:
                     )
                 continue
 
-            if "true" == await self._get_login_status(timeout_ms=500):
-                return
+            if "/id/login" not in self.page.url:
+                if "true" == await self._get_login_status(timeout_ms=500, warn_timeout=False):
+                    return
 
             await self.page.wait_for_timeout(500)
 
@@ -404,7 +405,9 @@ class EpicAuthorization:
             logger.warning("Could not resubmit Epic password form after captcha reset: {!r}", err)
             return False
 
-    async def _get_login_status(self, timeout_ms: int = 30000) -> str | None:
+    async def _get_login_status(
+        self, timeout_ms: int = 30000, *, warn_timeout: bool = True
+    ) -> str | None:
         if self._needs_privacy_policy_correction():
             return None
 
@@ -413,10 +416,11 @@ class EpicAuthorization:
                 "isloggedin", timeout=timeout_ms
             )
         except PlaywrightTimeoutError:
-            logger.warning(
-                "Timed out while waiting for //egs-navigation during auth check | current_url='{}'",
-                self.page.url,
-            )
+            if warn_timeout:
+                logger.warning(
+                    "Timed out while waiting for //egs-navigation during auth check | current_url='{}'",
+                    self.page.url,
+                )
             return None
 
     async def _has_account_session(self) -> bool:
