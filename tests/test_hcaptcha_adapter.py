@@ -5,6 +5,8 @@ import cv2
 import numpy as np
 from hcaptcha_challenger.models import PointCoordinate, SpatialPath
 
+import extensions.hcaptcha_adapter as hcaptcha_adapter
+from extensions.numbered_line_solver import NumberedDragSolution
 from extensions.hcaptcha_adapter import (
     _correct_drag_source_points,
     _decode_entity_contour,
@@ -140,6 +142,31 @@ def test_line_gap_markers_use_cyan_three_and_yellow_five():
 
 def test_line_question_detection_tolerates_confusable_words():
     assert _is_line_completion_question("Please ԁrag the segment on the right to сomplete the line")
+
+
+def test_line_path_uses_numbered_circle_target_for_source_three(monkeypatch, tmp_path):
+    payload = SimpleNamespace(
+        get_requester_question=lambda: "Please drag the segment on the right to complete the line"
+    )
+    monkeypatch.setattr(hcaptcha_adapter, "_payload_source_points", lambda **_kwargs: [(810, 310)])
+    monkeypatch.setattr(
+        hcaptcha_adapter,
+        "solve_numbered_line_drag",
+        lambda *_args: NumberedDragSolution(
+            start=(830, 300), end=(520, 410), source_label=3, digit_count=6, score=0.1
+        ),
+    )
+
+    paths = hcaptcha_adapter._resolve_line_path(
+        captcha_payload=payload,
+        crumb_id=0,
+        challenge_screenshot=tmp_path / "challenge.png",
+        challenge_bbox={"x": 390.0, "y": 100.0, "width": 500.0, "height": 470.0},
+    )
+
+    assert paths is not None
+    assert paths[0].start_point.model_dump() == {"x": 810, "y": 310}
+    assert paths[0].end_point.model_dump() == {"x": 520, "y": 410}
 
 
 def test_empty_checkcaptcha_response_is_queued_after_grace_period():

@@ -13,6 +13,8 @@ from hcaptcha_challenger.models import CaptchaResponse, PointCoordinate, Spatial
 from loguru import logger
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
+from extensions.numbered_line_solver import solve_numbered_line_drag
+
 
 _EMPTY_CHECKCAPTCHA_GRACE_SECONDS = 5.0
 
@@ -327,15 +329,34 @@ def _resolve_line_path(
         challenge_screenshot=challenge_screenshot,
         challenge_bbox=challenge_bbox,
     )
-    target = _extract_line_target(challenge_screenshot)
-    if len(source_points) != 1 or target is None:
+    if len(source_points) != 1:
         logger.warning("Could not resolve numbered hCaptcha line locally; falling back to LLM")
         return None
 
-    target_points = _map_canvas_points_to_page(
-        [target], challenge_screenshot=challenge_screenshot, challenge_bbox=challenge_bbox
-    )
+    numbered_solution = None
+    if challenge_bbox:
+        try:
+            numbered_solution = solve_numbered_line_drag(challenge_screenshot, challenge_bbox)
+        except Exception as err:
+            logger.warning("Numbered-circle template matching failed: {!r}", err)
+
+    if numbered_solution is not None:
+        target_points = [numbered_solution.end]
+        strategy = (
+            f"numbered-circles:1-{numbered_solution.digit_count}/"
+            f"source={numbered_solution.source_label}/score={numbered_solution.score:.3f}"
+        )
+    else:
+        target = _extract_line_target(challenge_screenshot)
+        target_points = _map_canvas_points_to_page(
+            [target] if target is not None else [],
+            challenge_screenshot=challenge_screenshot,
+            challenge_bbox=challenge_bbox,
+        )
+        strategy = "color-markers"
+
     if len(target_points) != 1:
+        logger.warning("Could not resolve numbered hCaptcha line locally; falling back to LLM")
         return None
 
     path = SpatialPath(
@@ -343,7 +364,8 @@ def _resolve_line_path(
         end_point=PointCoordinate(x=target_points[0][0], y=target_points[0][1]),
     )
     logger.info(
-        "Resolved numbered hCaptcha line locally | from={} to={}",
+        "Resolved numbered hCaptcha line deterministically | strategy={} from={} to={}",
+        strategy,
         (path.start_point.x, path.start_point.y),
         (path.end_point.x, path.end_point.y),
     )
