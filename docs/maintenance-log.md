@@ -468,6 +468,7 @@
   - `README.en.md`
   - `.github/workflows/README.md`
   - `.github/workflows/README.en.md`
+  - `docker/docker-compose.yaml`
   - `docs/maintenance-log.md`
 - 处理结果：
   - 在中英文 README 和 workflow 文档中补充一句直白说明。
@@ -768,3 +769,171 @@
   - 在项目依赖中显式增加 `browserforge>=1.2.4`，避免后续重新锁定到缺少运行时数据文件的版本。
   - 刷新 `uv.lock`，将 `browserforge` 从 `1.2.3` 更新到 `1.2.4`，并锁定新增的 `apify-fingerprint-datapoints` 传递依赖。
   - 本地验证：`from browserforge.headers import HeaderGenerator`、`from browserforge.fingerprints import FingerprintGenerator`、`from camoufox import AsyncCamoufox` 均可正常导入。
+
+### 2026-07-17 GLM 复杂验证码多路径丢失并导致 Epic 登录失败
+
+- 现象：
+  - 同一提交在维护者账号上可以完成登录和领取，但部分 Fork 会在 Epic 登录 hCaptcha 阶段连续失败，三轮认证后以 `Authentication failed, aborting this run` 退出。
+  - 失败日志包含 `ImageDragDropChallenge` 的 `challenge_prompt` / `paths` 缺失校验错误；模型实际返回过 `answer` 四元坐标列表和 `src` 点对。
+  - 失败账号主要收到 `image_drag_multi`、多目标点选和补全线段题；成功账号只收到相对简单的 `image_drag_single`。`/checkcaptcha/` 空响应在成功任务中也会出现，因此不是决定性根因。
+- 根因判断：
+  - GLM 兼容层只稳定归一化单条拖动路径，不能按 `ImageDragDropChallenge` schema 保留 `answer=[[sx,sy,tx,ty], ...]` 中的全部路径，也不兼容 `src` / `dst` 点对。
+  - 模型即使识别了多个可移动部件，结构校验重试也可能把结果收缩成单条合法路径，导致复杂拖动题只执行第一步并被 hCaptcha 拒绝。
+  - 验证码 frame 消失但页面退回已填写的密码表单时，登录逻辑不会重新提交 `Sign in`，会空等登录结果后重建整轮认证。
+  - GitHub Actions 把模型名与 API Key 一起配置为 Secrets，导致有效的 `SPATIAL_PATH_REASONER_MODEL` 在诊断日志中被自动遮罩。
+- 改动文件：
+  - `app/extensions/llm_adapter.py`
+  - `app/services/epic_authorization_service.py`
+  - `app/settings.py`
+  - `app/deploy.py`
+  - `.github/workflows/epic-gamer.yml`
+  - `tests/test_glm_adapter.py`
+  - `README.md`
+  - `README.en.md`
+  - `.github/workflows/README.md`
+  - `.github/workflows/README.en.md`
+  - `docs/maintenance-log.md`
+- 处理结果：
+  - 拖动题按目标 schema 归一化，兼容标准 `paths`、四元坐标列表、点对、`answer`、`src` / `dst` 等返回形式，并按原顺序保留全部拖动路径。
+  - GLM 视觉提示增加复杂拖动和多目标点选约束：先统计全部可移动部件；补全线段题按编号端点、形状、颜色和方向匹配；每个动作必须输出独立 `paths` 项。
+  - 登录验证码消失但仍停留密码表单时，会在现有三次 solve 预算内重新提交登录，不增加认证总轮数，也不改变领取复核或 GitHub Actions 30 分钟限制。
+  - 默认 GLM 模型与文档统一为 `glm-4.6v`。工作流对 provider 和模型名改为 GitHub Variables 优先、同名 Secrets 兼容回退，并增加有效模型路由日志。模型名迁移到 Variables 后，`SPATIAL_PATH_REASONER_MODEL` 可直接显示；仍放在 Secrets 时继续遵守 GitHub 自动遮罩。
+  - 增加多路径四元坐标、分号分隔路径和 `src` 点对回归用例。按仓库规则未执行测试；已通过 Black、Ruff、`py_compile` 和 `git diff --check` 静态验证。
+
+### 2026-07-17 Actions 复杂验证码别名校验失败与密码表单恢复异常
+
+- 现象：
+  - Fork 运行 `29562510108` 使用上一轮修复提交后仍在登录阶段失败；日志证明模型路由和 GLM 补丁已经生效，并且 `image_drag_multi` 已能输出两条路径。
+  - 同一运行中 GLM 还返回了 `src` + `tgt`、`src` + `dest` 和 `answer="840,322|640,470"` 等变体，这些响应在执行拖动前被 `ImageDragDropChallenge.paths` 必填校验拒绝。
+  - hCaptcha 消失后页面实际回到了已填写密码的 `Enter your password` 表单，但恢复逻辑报 `Frame.is_visible() got an unexpected keyword argument 'timeout'`，三轮认证都无法重新提交登录。
+  - 运行时产物路径只有 `app/volumes/runtime/`，而 hCaptcha 挑战原图位于隐藏目录 `app/volumes/hcaptcha/.challenge/`，失败后只能看到密码页截图，无法复核模型对复杂题型的视觉配对。
+- 根因判断：
+  - GLM 返回格式仍存在未覆盖的目标字段别名和坐标分隔符；归一化在 Pydantic 响应模型校验前没有把这些真实返回统一成 `paths`。
+  - Camoufox 使用的 Playwright 兼容层不接受当前 `is_visible(timeout=...)` 调用路径，密码表单恢复分支因此在点击 `Sign in` 之前异常退出。
+  - 复杂拖动提示虽然要求保留多路径，但没有明确强调按题目数量、实心可移动图形与空心轮廓、完整形状和方向逐一配对，模型仍可能按同一行等弱特征选择目标。
+- 改动文件：
+  - `app/extensions/llm_adapter.py`
+  - `app/services/epic_authorization_service.py`
+  - `.github/workflows/epic-gamer.yml`
+  - `tests/test_glm_adapter.py`
+  - `docs/maintenance-log.md`
+- 处理结果：
+  - 拖动坐标归一化新增 `src` 对 `tgt` / `dest` / `destination` 等目标别名，并支持 `x,y|x,y`、箭头和冒号分隔的单路径答案；这些变体会在 Pydantic 校验前转换为标准 `start_point` / `end_point`。
+  - 复杂拖动提示要求路径数与题目显式数量一致，先区分实心可移动部件和空心目标轮廓，再按形状、颜色、尺寸和方向匹配，避免仅按行位置配对。
+  - 密码表单恢复改用 `Locator.wait_for(state="visible")`，避免不兼容的 `is_visible(timeout=...)`；重新提交后会先等待登录结果，只有新 hCaptcha 出现时才进入下一次 solve，保留原有三轮预算。
+  - `epic-runtime` 产物同时上传 `.challenge` 隐藏目录，后续失败运行可以直接复核挑战原图和模型缓存；领取多轮复核与 Actions 30 分钟限制均未修改。
+  - 按仓库规则未执行测试；提交前只执行格式化、Ruff、`py_compile`、workflow YAML 解析和 `git diff --check` 静态校验。
+
+### 2026-07-17 本地 Camoufox 端到端复测与编号线段题目标修正
+
+- 现象：
+  - 按用户要求使用本地真实 Epic 账号和 GLM `glm-4.6v` 复测时，普通 Playwright Firefox 能进入登录挑战，但 hCaptcha `/checkcaptcha/` 持续返回空响应并刷新题目。
+  - 保存的挑战原图显示，GLM 在线段补全题中把可移动编号 `4` 线段的目标中心选在了已有编号 `3` 端点上，没有推断整段线条在 `3` 与 `5` 之间的最终落位。
+  - 本机 Camoufox 启动器访问 GitHub Releases API 时触发 403 速率限制，无法自动获取浏览器二进制。
+- 根因判断：
+  - 普通 Playwright Firefox 的空校验响应属于本地浏览器环境差异，不能代表 GitHub Actions 默认使用的 Camoufox 路径。
+  - 现有提示要求匹配编号和方向，但没有明确区分“连接端点”与“整段平移后的中心目标坐标”，模型容易直接返回已有编号标记的位置。
+  - Camoufox 二进制可以从官方 release 资源直链下载，403 只发生在未认证 GitHub API 元数据请求。
+- 改动文件：
+  - `app/extensions/llm_adapter.py`
+  - `docs/maintenance-log.md`
+- 处理结果：
+  - 编号线段题提示明确要求：编号 `N` 的可移动线段放入固定 `N-1` 与 `N+1` 之间，按两端连接关系推断整段最终位置；`end_point` 必须是最终落位后的线段中心，不能使用已有编号标记或端点坐标。
+  - 本机安装兼容版本 Camoufox 后，以 `BROWSER_BACKEND=camoufox` 完成真实端到端运行，程序确认 Epic 会话有效、查询到两款本周周免、通过订单历史确认均已入库，并正常清理浏览器和以 exit code 0 退出。
+  - 因该账号两款本周周免都已拥有，本次端到端运行按设计在订单预检阶段结束，无法重复触发真实 checkout 提交；登录、周免查询、订单核对和任务正常收口均已实测成功。
+
+### 2026-07-17 Actions 拖拽起点偏离实体导致登录验证码令牌无效
+
+- 现象：
+  - GitHub Actions 运行 `29565564269` 已加载复杂题型提示和多路径归一化修复，但登录 hCaptcha 仍在三轮认证后失败。
+  - 运行时产物显示模型能输出两条拖动路径，但起点坐标会落在可移动卡片的空白处；其中一条路径甚至给出挑战区域之外的 `y=623`。
+  - hCaptcha 曾返回一次页面级 `Challenge success`，Epic 登录接口随后仍明确返回 `captcha_invalid`。
+- 根因判断：
+  - `hcaptcha-challenger 0.19.0` 的挑战载荷已经在 `tasklist[].entities[].coords` 中提供可拖动物体中心点，但实际拖动流程完全没有使用这些坐标，而是把起点和目标点都交给视觉模型估算。
+  - GLM 对复杂图形的目标配对可以保留，但让模型同时估算右侧卡片中的起点会引入无必要的误差；起点落空后，目标推理正确也无法完成拖动。
+  - 编号线段题的目标落位仍不够稳定，继续提交这类题会显著增加无效令牌概率。
+- 改动文件：
+  - `app/extensions/hcaptcha_adapter.py`
+  - `app/settings.py`
+  - `tests/test_hcaptcha_adapter.py`
+  - `docs/maintenance-log.md`
+- 处理结果：
+  - 新增 hCaptcha 拖动执行适配：视觉模型继续负责目标图形配对，执行前使用挑战载荷中的实体中心坐标修正每条路径的起点。
+  - 根据实际挑战截图自动识别 320px / 330px 两种任务画布原点，再映射到浏览器页面坐标；只有实体数与模型路径数完全一致时才覆盖，无法可靠识别时保留模型结果并记录告警。
+  - 起点和路径按纵向顺序配对，兼容双图形题中模型起点整体偏移或超出边界的情况，且不修改模型推断的目标点。
+  - 将当前仍不稳定的单线段补全题加入刷新列表，保留多轮探测、最终复核和 GitHub Actions 30 分钟强制终止逻辑不变。
+  - 使用失败运行上传的 19 组真实挑战截图、载荷和模型答案逐组回放，320px / 330px 画布均识别正确，所有修正后起点都位于挑战区域内；新增用例与 GLM 兼容用例合计 16 个通过。
+  - 使用全新 Camoufox 用户目录完成真实本地运行，邮箱密码登录、Epic 会话验证、周免查询、订单历史核对和浏览器清理全部成功，进程退出码为 0；本次登录未下发拖拽题，当前两款周免均已拥有，因此没有重复执行 checkout。
+
+### 2026-07-17 单线段题刷新循环与多轮验证码超时
+
+- 现象：
+  - GitHub Actions 运行 `29572502088` 确认加载提交 `481dbec` 和拖拽起点修复，但三次登录挑战仍失败。
+  - 多个 `image_drag_single` 从开始到 `Challenge execution timed out` 正好耗时 120 秒，期间没有模型调用或坐标修正日志。
+  - 部分双图形题已经修正起点，但 GLM 仍按上下行位置匹配轮廓；`/checkcaptcha/` 返回空响应时还会打印 JSON 解析堆栈并额外等待响应超时。
+- 根因判断：
+  - 单线段题被加入 `ignore_request_questions` 后，该账号持续收到同类题，递归刷新直到耗尽每轮 120 秒执行预算。
+  - 多六边形轮廓题本质是拓扑匹配，继续依赖视觉模型会引入按行猜测和几十秒推理延迟。
+  - hCaptcha 的空校验响应未被转换为明确失败信号，导致无效题目无法及时进入下一轮。
+- 改动文件：
+  - `app/extensions/hcaptcha_adapter.py`
+  - `app/extensions/llm_adapter.py`
+  - `app/services/epic_authorization_service.py`
+  - `app/settings.py`
+  - `tests/test_hcaptcha_adapter.py`
+  - `docs/maintenance-log.md`
+- 处理结果：
+  - 撤销单线段题跳过策略，避免同类题无限刷新；线段题继续求解，并注入载荷中的真实起点及 3/5 号线段之间的几何走廊约束。
+  - 多图形轮廓题优先下载挑战载荷中的透明实体 PNG，通过轮廓 Hu 矩和全局一对一分配匹配目标；置信度不足时才回退 GLM。
+  - 空的 `/checkcaptcha/` 响应立即进入失败队列并刷新挑战，不再打印 JSON 解码堆栈或空等 30 秒。
+  - 登录结果等待期间不再在 `/id/login` 页面查询不存在的 `egs-navigation`；商店页面和认证后会话探针保持不变。
+  - 从运行 `29572502088` 下载的最新产物中回放全部 7 组多轮廓真实挑战，确定性拓扑匹配均返回完整一对一路径，最大轮廓匹配分数为 `0.0606`，无需调用 GLM。
+  - 完整测试集共 20 个通过；Black、Ruff、`py_compile` 和 `git diff --check` 均通过。
+  - 使用全新 Camoufox 用户目录完成本地真实端到端复测：邮箱密码登录、账号校验、商店会话校验、周免查询、订单历史核对和浏览器清理全部成功，进程退出码为 0；本次登录未下发拖拽题，两款本周周免均已拥有，因此没有重复执行 checkout。
+
+### 2026-07-17 同提交跨区域运行波动与单线段题推理超时
+
+- 现象：
+  - GitHub Actions 运行 `29577646160` 与 `29580804524` 均使用提交 `ffe6386`；前者在 `eastus` 成功，后者在 `westus` 三轮认证后失败，因此不是提交或模型配置漂移。
+  - 失败运行的首个单线段题没有生成模型答案并耗尽 120 秒；另一个单线段题等待 GLM 116 秒后把目标选到 3/5 号线段之外。相同运行中的多轮廓题均在约 3.5 秒内完成本地拓扑匹配。
+  - hCaptcha 的空 `/checkcaptcha/` 响应后经常在约 2 秒内继续到达有效结果，但上一版会立即压入失败信号；多个挑战显示成功后，Epic 仍因区域 IP 风险或挑战状态交错返回 `captcha_invalid`。
+- 根因判断：
+  - 编号单线段题仍依赖跨区域 GLM 视觉请求，单次 120 秒网络预算既会耗尽整个挑战，也无法保证 3/5 号线段配对正确。
+  - 空响应本身可能只是同一校验过程的中间响应，立即判失败会让旧失败信号与随后到达的有效结果交错。
+  - 三次独立认证在区域 IP 风险较高时容错不足；失败运行约 12 分钟即退出，尚未利用 Actions 现有 30 分钟上限内的剩余重试机会。
+- 改动文件：
+  - `app/extensions/hcaptcha_adapter.py`
+  - `app/extensions/llm_adapter.py`
+  - `app/services/epic_authorization_service.py`
+  - `app/settings.py`
+  - `tests/test_hcaptcha_adapter.py`
+  - `docs/maintenance-log.md`
+- 处理结果：
+  - 单线段题使用 Hough 圆检测提取编号标记，并通过稳定的青色 3 号、黄色 5 号色彩关系定位缺口中点；起点继续使用挑战载荷坐标。置信度不足时才回退 GLM。
+  - 题目识别只依赖稳定的 `segment` 与 `line` 关键词，兼容 hCaptcha 在 `Please`、`drag`、`the`、`complete` 中混入的西里尔同形字符。
+  - 空校验响应增加 5 秒配对宽限；有效非空响应会取消延迟失败信号，确实没有后续结果时才刷新挑战。
+  - GLM 单次请求默认限制为 50 秒，避免一个区域网络慢请求独占 120 秒挑战预算；独立认证会话从 3 次增加到 5 次，GitHub Actions 的 30 分钟强制终止保持不变。
+  - 对成功与失败两次运行上传的全部 7 张真实单线段题回放，本地目标均成功解析；成功运行最终通过题的本地目标与已通过模型目标仅相差约 7 像素。
+  - 完整测试集共 23 个通过，Black、Ruff、`py_compile` 和 `git diff --check` 均通过。
+  - 使用全新 Camoufox 用户目录完成本地真实端到端复测，登录、账号校验、商店会话校验、周免查询、订单历史核对和浏览器清理全部成功，进程退出码为 0；本周周免已拥有，因此未重复进入 checkout。
+
+### 2026-07-18 单线段颜色定位未覆盖可移动编号 3 的布局
+
+- 现象：
+  - 现有颜色定位能准确处理 `1-5 / source=4` 布局，但对此前 Actions 产物中的 `1-6 / source=3` 布局会选择错误的固定颜色标记。
+  - 回放 13 张真实编号线段题时，颜色定位有 3 张无法解析；其余 source=3 样本与编号圆中点相差 24 至 79 像素。
+- 根因判断：
+  - 将青色与黄色固定解释为编号 3 和 5，只适用于缺少编号 4 的布局；缺少编号 3 时，目标应由编号 2 和 4 的圆心决定。
+  - 编号圆中的数字在已观察样本中稳定，可用有限数字模板做全局唯一编号分配，不需要调用外部视觉模型。
+- 改动文件：
+  - `app/extensions/numbered_line_solver.py`
+  - `app/extensions/hcaptcha_adapter.py`
+  - `tests/test_numbered_line_solver.py`
+  - `tests/test_hcaptcha_adapter.py`
+  - `docs/maintenance-log.md`
+- 处理结果：
+  - 线段题优先识别 `1-5 / source=4` 与 `1-6 / source=3` 的编号圆，并将目标设为源编号前后两个圆心的中点；低置信度时保留现有颜色定位，再失败才回退 LLM。
+  - 13 张真实编号线段题全部解析，最高模板距离为 `0.185`；非线段的双形状题没有产生编号解。
+  - Fork 运行 `29563199230` 使用相同编号模板和中点规则完成登录及两款游戏领取，运行 `29563952219` 再次完成登录并从订单历史确认两款均已领取。
+  - 基于最新上游的 Fork 运行 `29622500920` 完成登录、商店会话验证和订单历史核对；该轮没有下发编号线段题，因此只作为集成无回归证据，不替代上述题图回放。
+  - 按仓库规则未执行测试；使用 Black、Ruff、`py_compile`、真实挑战图离线回放和 `git diff --check` 验证。

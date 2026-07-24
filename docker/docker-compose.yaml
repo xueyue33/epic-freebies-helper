@@ -26,7 +26,7 @@ services:
       # - LLM_PROVIDER=glm
       # - GLM_API_KEY=your_glm_api_key
       # - GLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
-      # - GLM_MODEL=glm-4.5v
+      # - GLM_MODEL=glm-4.6v
 
       # ----------------------------------------
       # 运行参数
