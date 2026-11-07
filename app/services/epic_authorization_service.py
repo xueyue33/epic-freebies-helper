@@ -827,8 +827,22 @@ class EpicAuthorization:
                 return False
 
             if "true" == await self._get_login_status():
-                logger.success("Epic Games is already logged in")
-                return True
+                # `isloggedin` 只说明商店 token 还有效：它由 refresh token 在每次页面加载时
+                # 自动续期，而账号层 auth（8h / 24h）过期之后它仍然是 "true"。原版据此直接
+                # 判定"已登录"并返回，于是失效的会话永远不会触发重新登录，之后每次点击购买
+                # 都会被重定向到 /id/login/switch-account，整轮空转十几分钟才在收尾复核时失败。
+                # 这里用订单历史接口复核一次（约 2 秒），不通过就落到下面的 _login() 真登录。
+                if await self._has_account_session():
+                    logger.success("Epic Games is already logged in")
+                    return True
+                logger.warning(
+                    "Store reports a logged-in session but the order-history probe rejected it; "
+                    "forcing a fresh login"
+                )
+                await self._goto_claim_page()
+                if await self._has_account_session():
+                    logger.success("Epic Games is already logged in (session confirmed on retry)")
+                    return True
 
             try:
                 if await self._login():
