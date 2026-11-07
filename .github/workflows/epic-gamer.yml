@@ -1,18 +1,14 @@
 name: Epic Awesome Gamer (Scheduled)
 
 on:
-  workflow_dispatch: # 手动触发
-  schedule:
-    # 每周四 UTC 15:20 运行一次（北京时间周四 23:20）
-    # 该时间点放在 Epic 周免刷新之后，避免过早触发。
-    - cron: '20 15 * * 4'
+  workflow_dispatch: # 手动触发（已切换至 Docker 定时运行，关闭 Actions 自动定时）
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   epic-gamer:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # A single account run can take 15-20 minutes. Multi-account runs are
     # sequential, so scale the timeout with the number of accounts by setting
     # a repository variable JOB_TIMEOUT_MINUTES (Settings -> Secrets and

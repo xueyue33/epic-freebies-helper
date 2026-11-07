@@ -288,26 +288,42 @@ async def deploy():
     )
 
     # Execute an immediate collection task (single- or multi-account)
-    await _run_accounts(headless=headless)
-
-    # Skip scheduler setup if disabled in configuration
-    if not settings.ENABLE_APSCHEDULER:
+    if settings.ENABLE_APSCHEDULER:
+        try:
+            await _run_accounts(headless=headless)
+        except Exception as err:
+            logger.error(f"Startup collection task failed (scheduler will still start): {err}")
+    else:
+        await _run_accounts(headless=headless)
         logger.debug("Scheduler is disabled, deployment completed")
         return
 
     # Initialize and configure async scheduler
     scheduler = AsyncIOScheduler()
 
-    # Strategy 1: Thursday 23:30 to Friday 03:30, every hour (Beijing Time)
+    # Strategy 1: Thursday 23:30 (Beijing Time, right after Epic weekly refresh)
     scheduler.add_job(
         _run_accounts,
         trigger=CronTrigger(
-            day_of_week="thu", hour="23,0,1,2,3", minute="30", timezone="Asia/Shanghai"
+            day_of_week="thu", hour="23", minute="30", timezone="Asia/Shanghai"
         ),
-        id="weekly_epic_games_task",
-        name="weekly_epic_games_task",
+        id="weekly_epic_games_thu_night",
+        name="weekly_epic_games_thu_night",
         args=[headless],
-        replace_existing=False,
+        replace_existing=True,
+        max_instances=1,
+    )
+
+    # Strategy 1b: Friday 00:30 & 01:30 (Beijing Time, fallback window)
+    scheduler.add_job(
+        _run_accounts,
+        trigger=CronTrigger(
+            day_of_week="fri", hour="0,1", minute="30", timezone="Asia/Shanghai"
+        ),
+        id="weekly_epic_games_fri_early",
+        name="weekly_epic_games_fri_early",
+        args=[headless],
+        replace_existing=True,
         max_instances=1,
     )
 

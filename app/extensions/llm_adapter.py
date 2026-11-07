@@ -738,6 +738,19 @@ def _normalize_glm_answer_value(
             }
         )
 
+    if isinstance(value, list):
+        points = _extract_points_from_value(value)
+        if points:
+            return _build_points_payload(
+                points, challenge_prompt=challenge_prompt, inferred_rule=inferred_rule
+            )
+        paths = _extract_drag_paths_from_value(value)
+        if paths:
+            return _build_drag_paths_payload(
+                paths, challenge_prompt=challenge_prompt, inferred_rule=inferred_rule
+            )
+        return None
+
     if not isinstance(value, str):
         return None
 
@@ -953,7 +966,12 @@ def _coerce_payload_for_schema(payload: dict[str, Any], schema: Any, text: str) 
     return payload
 
 
-def _normalize_glm_payload(payload: dict[str, Any]) -> dict[str, Any]:
+def _normalize_glm_payload(payload: Any) -> dict[str, Any]:
+    if isinstance(payload, list):
+        payload = {"answer": payload}
+    elif not isinstance(payload, dict):
+        return {}
+
     challenge_prompt = _coerce_challenge_prompt(payload)
     inferred_rule = str(payload.get("inferred_rule") or "")
 
@@ -1325,6 +1343,7 @@ def apply_gemini_patch(settings: Any):
             return types.File(name=file_id, uri=file_id, mime_type=_guess_mime_type(file))
 
         orig_generate = genai.models.AsyncModels.generate_content
+        helper_parser = _GLMAsyncModels(settings, {})
 
         async def patched_generate(self_models, model, contents, **kwargs):
             normalized = _ensure_list(contents)
@@ -1337,7 +1356,32 @@ def apply_gemini_patch(settings: Any):
                             data=file_cache[file_uri], mime_type=_guess_mime_type(file_uri)
                         )
 
-            return await orig_generate(self_models, model=model, contents=normalized, **kwargs)
+            resp = await orig_generate(self_models, model=model, contents=normalized, **kwargs)
+            config = kwargs.get("config")
+            schema = getattr(config, "response_schema", None) if config else None
+            if schema and isinstance(schema, type) and issubclass(schema, BaseModel):
+                parsed = getattr(resp, "parsed", None)
+                text = getattr(resp, "text", None) or ""
+                if not isinstance(parsed, schema) and text:
+                    with suppress(Exception):
+                        coerced = helper_parser._parse_response(text, config)
+                        if isinstance(coerced, schema):
+                            return _PatchedResponse(
+                                text=coerced.model_dump_json(),
+                                parsed=coerced,
+                                raw={"text": text},
+                            )
+                elif isinstance(parsed, schema):
+                    # Ensure text is also a JSON object (not list) in case upstream re-parses text
+                    with suppress(Exception):
+                        raw_json = _extract_json_payload(text)
+                        if isinstance(raw_json, list):
+                            return _PatchedResponse(
+                                text=parsed.model_dump_json(),
+                                parsed=parsed,
+                                raw={"text": text},
+                            )
+            return resp
 
         genai.files.AsyncFiles.upload = patched_upload
         genai.models.AsyncModels.generate_content = patched_generate
