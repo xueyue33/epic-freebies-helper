@@ -46,7 +46,7 @@ URL_PRODUCT_PAGE = "https://store.epicgames.com/en-US/p/"
 URL_PRODUCT_BUNDLES = "https://store.epicgames.com/en-US/bundles/"
 URL_ORDER_HISTORY = "https://www.epicgames.com/account/v2/payment/ajaxGetOrderHistory"
 PURCHASE_IFRAME_SELECTOR = (
-    "//iframe[contains(@id, 'webPurchaseContainer') or contains(@src, 'purchase')]"
+    "//iframe[contains(@id, 'webPurchaseContainer') or contains(@src, 'purchase') or contains(@src, 'checkout')]"
 )
 # 商品页购买按钮：新版商店用 sidebarBuyButton（data-testid 已不再出现），旧版用
 # purchase-cta-button。后面几个按按钮文案兜底，兼顾英文、中文和 Add to Cart 流程。
@@ -422,18 +422,18 @@ class EpicGames:
         self._promotions: List[PromotionGame] = []
 
     @staticmethod
-    async def _locator_visible_text(locator, timeout: int | None = None) -> str:
+    async def _locator_visible_text(locator, timeout: int | None = 1500) -> str:
         with suppress(Exception):
             options = {} if timeout is None else {"timeout": timeout}
             return " ".join(((await locator.inner_text(**options)) or "").upper().split())
         return ""
 
     @staticmethod
-    async def _page_text(page: Page, timeout: int | None = None) -> str:
+    async def _page_text(page: Page, timeout: int | None = 1500) -> str:
         return await EpicGames._locator_visible_text(page.locator("body"), timeout=timeout)
 
     @staticmethod
-    async def _frame_texts(page: Page, timeout: int | None = None) -> list[str]:
+    async def _frame_texts(page: Page, timeout: int | None = 800) -> list[str]:
         texts: list[str] = []
         options = {} if timeout is None else {"timeout": timeout}
         for frame in page.frames:
@@ -446,7 +446,7 @@ class EpicGames:
 
     @staticmethod
     async def _combined_text(
-        page: Page, timeout: int | None = None, frame_timeout: int | None = None
+        page: Page, timeout: int | None = 1500, frame_timeout: int | None = 800
     ) -> str:
         chunks = [await EpicGames._page_text(page, timeout=timeout)]
         chunks.extend(
@@ -480,21 +480,21 @@ class EpicGames:
         with suppress(Exception):
             purchase_btn = await EpicGames._find_purchase_cta(page)
             if await purchase_btn.is_visible():
-                return ((await purchase_btn.text_content()) or "").strip().upper()
+                return ((await purchase_btn.text_content(timeout=1000)) or "").strip().upper()
         return ""
 
     @staticmethod
     async def _purchase_frame_text(page: Page) -> str:
         with suppress(Exception):
             purchase_frame_body = page.frame_locator(PURCHASE_IFRAME_SELECTOR).first.locator("body")
-            frame_text = await purchase_frame_body.inner_text()
+            frame_text = await purchase_frame_body.inner_text(timeout=1000)
             if frame_text:
                 return " ".join(frame_text.upper().split())
         return ""
 
     @staticmethod
     async def _visible_hcaptcha_frame_urls(
-        page: Page, min_width: int = 160, min_height: int = 40
+        page: Page, min_width: int = 250, min_height: int = 250
     ) -> list[str]:
         urls: list[str] = []
 
@@ -509,16 +509,31 @@ class EpicGames:
                     """
                     (element) => {
                       const rect = element.getBoundingClientRect();
-                      const style = window.getComputedStyle(element);
+                      let cur = element;
+                      while (cur && cur.nodeType === 1) {
+                        const st = window.getComputedStyle(cur);
+                        const r = cur.getBoundingClientRect();
+                        if (
+                          st.visibility === 'hidden' ||
+                          st.display === 'none' ||
+                          parseFloat(st.opacity) === 0 ||
+                          r.width <= 0 ||
+                          r.height <= 0
+                        ) {
+                          return { width: rect.width, height: rect.height, visible: false };
+                        }
+                        cur = cur.parentElement;
+                      }
                       return {
                         width: rect.width,
                         height: rect.height,
                         visible:
                           rect.width > 0 &&
                           rect.height > 0 &&
-                          style.visibility !== 'hidden' &&
-                          style.display !== 'none' &&
-                          style.opacity !== '0'
+                          rect.bottom > 0 &&
+                          rect.right > 0 &&
+                          rect.top < window.innerHeight &&
+                          rect.left < window.innerWidth
                       };
                     }
                     """
@@ -1128,7 +1143,7 @@ class EpicGames:
             else:
                 fallback_frames.append(frame)
 
-        return [*structural_frames, *purchase_frames, *fallback_frames, page]
+        return [*purchase_frames, *structural_frames, *fallback_frames, page]
 
     @staticmethod
     async def _visible_checkout_submit(container: PurchaseContainer, timeout_ms: int):
@@ -1284,21 +1299,20 @@ class EpicGames:
         deadline = time.monotonic() + max(timeout_ms, 0) / 1000
 
         while time.monotonic() < deadline:
-            if await self._is_checkout_security_check_visible(page):
-                logger.debug(f"Checkout readiness interrupted by security check. {url=}")
-                return None
-
             remaining_ms = int((deadline - time.monotonic()) * 1000)
             if remaining_ms <= 0:
                 break
             try:
                 payload = await self._active_purchase_container(
                     page,
-                    place_order_timeout=min(500, remaining_ms),
-                    confirm_timeout=min(500, remaining_ms),
+                    place_order_timeout=min(2500, remaining_ms),
+                    confirm_timeout=min(1500, remaining_ms),
                     log_missing=False,
                 )
             except AssertionError:
+                if await self._is_checkout_security_check_visible(page):
+                    logger.debug(f"Checkout readiness interrupted by security check. {url=}")
+                    return None
                 remaining_ms = int((deadline - time.monotonic()) * 1000)
                 if remaining_ms > 0:
                     await page.wait_for_timeout(min(500, remaining_ms))
@@ -1310,6 +1324,10 @@ class EpicGames:
 
             if not overlay_id and not disabled_state:
                 return payload
+
+            if await self._is_checkout_security_check_visible(page):
+                logger.debug(f"Checkout readiness interrupted by security check. {url=}")
+                return None
 
             logger.debug(
                 "Checkout container is visible but not ready yet. {} | overlay={} | button={}",
@@ -1339,17 +1357,17 @@ class EpicGames:
             if await self._is_claimed_state(page, url):
                 return "claimed", None
 
-            if await self._is_checkout_security_check_visible(page):
-                return "security", None
-
             remaining_ms = int((deadline - time.monotonic()) * 1000)
             if remaining_ms <= 0:
                 break
             payload = await self._wait_for_checkout_ready(
-                page, url, timeout_ms=min(1000, remaining_ms)
+                page, url, timeout_ms=min(3500, remaining_ms)
             )
             if payload is not None:
                 return "checkout", payload
+
+            if await self._is_checkout_security_check_visible(page):
+                return "security", None
 
             remaining_ms = int((deadline - time.monotonic()) * 1000)
             if remaining_ms > 0:
@@ -1373,10 +1391,6 @@ class EpicGames:
         visible_locators = [
             page.get_by_text("One more step", exact=False),
             page.get_by_text("Please complete a security check to continue", exact=False),
-            page.locator("//iframe[contains(@src, 'hcaptcha') or contains(@title, 'hCaptcha')]"),
-            page.frame_locator(PURCHASE_IFRAME_SELECTOR).first.locator(
-                "//iframe[contains(@src, 'hcaptcha') or contains(@title, 'hCaptcha')]"
-            ),
         ]
 
         for locator in visible_locators:
@@ -1392,10 +1406,7 @@ class EpicGames:
             return True
 
         purchase_frame_text = await EpicGames._purchase_frame_text(page)
-        return any(marker in purchase_frame_text for marker in purchase_frame_markers) or any(
-            all(marker in purchase_frame_text for marker in markers)
-            for markers in purchase_frame_marker_pairs
-        )
+        return any(marker in purchase_frame_text for marker in page_markers)
 
     async def _resolve_checkout_security_check(
         self, page: Page, agent: AgentV, url: str, max_wait_ms: int = 600000
@@ -1693,13 +1704,13 @@ class EpicGames:
         parts: list[str] = []
 
         with suppress(Exception):
-            text = ((await payment_btn.text_content()) or "").strip()
+            text = ((await payment_btn.text_content(timeout=800)) or "").strip()
             if text:
                 parts.append(f"text='{text}'")
 
         for attr in ("disabled", "aria-disabled", "aria-busy", "class"):
             with suppress(Exception):
-                value = await payment_btn.get_attribute(attr)
+                value = await payment_btn.get_attribute(attr, timeout=800)
                 if value:
                     parts.append(f"{attr}='{value}'")
 

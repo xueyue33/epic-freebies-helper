@@ -97,10 +97,8 @@ def _camoufox_launch_options(headless: bool | str, proxy: dict[str, str] | None)
         "persistent_context": True,
         "user_data_dir": settings.user_data_dir_for("camoufox"),
         "screen": screen,
-        "record_video_dir": RECORD_DIR,
-        "record_video_size": _VIEWPORT,
         "firefox_user_prefs": firefox_user_prefs,
-        "humanize": 0.2,
+        "humanize": False,
         "headless": headless,
     }
     if proxy is not None:

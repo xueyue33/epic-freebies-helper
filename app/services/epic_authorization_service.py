@@ -714,15 +714,14 @@ class EpicAuthorization:
             await self.page.goto(point_url, wait_until="domcontentloaded")
             await self._wait_for_login_form(point_url)
 
-            # 1. 使用电子邮件地址登录
+            # 1. 使用电子邮件地址登录（若持久化 Profile 已记住邮箱且设为 readonly，直接填密码）
             email_input = self.page.locator("#email")
-            await email_input.fill(settings.EPIC_EMAIL)
-
-            # 2. 点击继续按钮
-            await self.page.click("#continue")
+            password_input = self.page.locator("#password")
+            if not await password_input.is_visible() and await email_input.is_editable():
+                await email_input.fill(settings.EPIC_EMAIL)
+                await self.page.click("#continue")
 
             # 3. 输入密码
-            password_input = self.page.locator("#password")
             await expect(password_input).to_be_visible(timeout=10000)
             await password_input.fill(settings.EPIC_PASSWORD.get_secret_value())
 
@@ -797,7 +796,10 @@ class EpicAuthorization:
             sr.mkdir(parents=True, exist_ok=True)
             with suppress(Exception):
                 await redact_totp_inputs(self.page)
-            await self.page.screenshot(path=sr.joinpath(f"login-{int(time.time())}.png"))
+            with suppress(Exception):
+                await self.page.screenshot(
+                    path=sr.joinpath(f"login-{int(time.time())}.png"), timeout=5000
+                )
             if isinstance(err, EpicAuthenticationFatalError):
                 logger.error(
                     "Epic account requires two-factor authentication. Configure EPIC_TOTP_SECRET "
@@ -817,6 +819,10 @@ class EpicAuthorization:
 
         max_attempts = settings.AUTH_MAX_ATTEMPTS
         for attempt in range(1, max_attempts + 1):
+            if await self._has_account_session():
+                logger.success("Epic Games is already logged in")
+                return True
+
             await self._goto_claim_page()
 
             if self._needs_privacy_policy_correction():
@@ -826,12 +832,7 @@ class EpicAuthorization:
                 )
                 return False
 
-            if "true" == await self._get_login_status():
-                # `isloggedin` 只说明商店 token 还有效：它由 refresh token 在每次页面加载时
-                # 自动续期，而账号层 auth（8h / 24h）过期之后它仍然是 "true"。原版据此直接
-                # 判定"已登录"并返回，于是失效的会话永远不会触发重新登录，之后每次点击购买
-                # 都会被重定向到 /id/login/switch-account，整轮空转十几分钟才在收尾复核时失败。
-                # 这里用订单历史接口复核一次（约 2 秒），不通过就落到下面的 _login() 真登录。
+            if "true" == await self._get_login_status(timeout_ms=10000):
                 if await self._has_account_session():
                     logger.success("Epic Games is already logged in")
                     return True
@@ -839,10 +840,6 @@ class EpicAuthorization:
                     "Store reports a logged-in session but the order-history probe rejected it; "
                     "forcing a fresh login"
                 )
-                await self._goto_claim_page()
-                if await self._has_account_session():
-                    logger.success("Epic Games is already logged in (session confirmed on retry)")
-                    return True
 
             try:
                 if await self._login():
