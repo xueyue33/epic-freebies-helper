@@ -73,6 +73,10 @@ FREE_GAME_RATE_LIMIT_MARKERS = (
 )
 INSTANT_CHECKOUT_TIMEOUT_MS = 15 * 60 * 1000
 RECONCILIATION_CHECKOUT_TIMEOUT_MS = 2 * 60 * 1000
+# 结账验证码解开之后，残留的 hCaptcha iframe 仍然会让安全检查被判定成「还在验证」，
+# 于是刚解开的验证码会被丢掉重解一遍。这里记住「已经解开过」，同时给出反馈式复位：
+# 连续这么多次提交都没有产生进展时，认为验证码可能真的重新出现了，允许再解一次。
+CAPTCHA_SOLVED_STALL_LIMIT = 2
 PurchaseContainer = FrameLocator | Frame | Page
 
 
@@ -1786,6 +1790,11 @@ class EpicGames:
         logger.info("🚀 Triggering Instant Checkout Flow...")
         agent = AgentV(page=page, agent_config=settings)
         deadline = time.monotonic() + max(timeout_ms, 0) / 1000
+        # 验证码是否已经解开过。解开后残留的 hCaptcha iframe 仍可能让
+        # _is_checkout_security_check_visible() 判成「还在验证」，不能据此重解。
+        captcha_solved = False
+        # 解出后连续「提交没有进展」的次数，用于反馈式复位。
+        stalled_submissions = 0
 
         def remaining_ms(limit_ms: int) -> int:
             return max(0, min(limit_ms, int((deadline - time.monotonic()) * 1000)))
@@ -1808,6 +1817,7 @@ class EpicGames:
                     page, agent, url, max_wait_ms=remaining_ms(600000)
                 ):
                     return await finalize_unconfirmed()
+                captcha_solved = True
                 state = "checkout"
                 payload = None
 
@@ -1832,13 +1842,26 @@ class EpicGames:
                         )
                         return True
                     if state == "security":
-                        if not await self._resolve_checkout_security_check(
-                            page, agent, url, max_wait_ms=remaining_ms(600000)
-                        ):
-                            return await finalize_unconfirmed()
-                        state = "checkout"
-                        payload = None
-                        continue
+                        if captcha_solved:
+                            # 刚解开过验证码，这个 security 多半是残留 iframe 造成的假状态。
+                            # 不要再解一遍，直接重新取支付按钮回到提交循环。
+                            logger.warning(
+                                "Ignoring stale security-check state after a successful "
+                                "captcha solve; retrying submission - {}",
+                                url,
+                            )
+                            with suppress(Exception):
+                                payload = await self._active_purchase_container(page)
+                            state = "checkout" if payload is not None else "security"
+                        else:
+                            if not await self._resolve_checkout_security_check(
+                                page, agent, url, max_wait_ms=remaining_ms(600000)
+                            ):
+                                return await finalize_unconfirmed()
+                            captcha_solved = True
+                            state = "checkout"
+                            payload = None
+                            continue
                     if state != "checkout" or payload is None:
                         break
 
@@ -1851,17 +1874,43 @@ class EpicGames:
                     await payment_btn.text_content(),
                 )
                 click_progressed = await self._submit_place_order(payment_btn, url)
-                if not click_progressed:
+                if click_progressed:
+                    stalled_submissions = 0
+                else:
+                    stalled_submissions += 1
                     logger.warning(
                         "Place Order submission produced no immediate progress; falling back to checkout probes. {}",
                         url,
                     )
+                    if captcha_solved and stalled_submissions >= CAPTCHA_SOLVED_STALL_LIMIT:
+                        # 反馈式复位：虽然解开过验证码，但连续多次提交都推不动，
+                        # 说明可能真的被重新拦下，允许再解一次。
+                        logger.warning(
+                            "Captcha was solved earlier but {} consecutive submissions made no "
+                            "progress; allowing a re-solve - {}",
+                            stalled_submissions,
+                            url,
+                        )
+                        captcha_solved = False
+                        stalled_submissions = 0
 
                 if await self._is_checkout_security_check_visible(page):
-                    if not await self._resolve_checkout_security_check(
+                    if captcha_solved or click_progressed:
+                        # 点击已经产生进展，或验证码刚解开过：这里的「还在验证」多半是
+                        # 残留 iframe，不要再解一遍，直接观察结果、重试提交。
+                        logger.debug(
+                            "Security-check looks stale (captcha_solved={} click_progressed={}); "
+                            "skipping re-solve - {}",
+                            captcha_solved,
+                            click_progressed,
+                            url,
+                        )
+                    elif not await self._resolve_checkout_security_check(
                         page, agent, url, max_wait_ms=remaining_ms(600000)
                     ):
                         return await finalize_unconfirmed()
+                    else:
+                        captcha_solved = True
                     outcome = await self._observe_checkout_outcome(
                         page, url, timeout_ms=remaining_ms(20000)
                     )
@@ -1902,6 +1951,7 @@ class EpicGames:
                             page, agent, url, max_wait_ms=remaining_ms(600000)
                         ):
                             return await finalize_unconfirmed()
+                        captcha_solved = True
                     if challenge_detected:
                         outcome = await self._observe_checkout_outcome(
                             page, url, timeout_ms=remaining_ms(30000)
