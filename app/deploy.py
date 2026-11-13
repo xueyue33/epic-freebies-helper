@@ -91,9 +91,13 @@ async def execute_browser_tasks(headless: bool | str = True, *, collect_summary:
             raise RuntimeError("Authentication failed, aborting this run")
         logger.debug("Authentication completed")
 
-        # Execute a free games collection on new page
+        # Execute a free games collection on new page (close auth pages to free RAM)
         logger.debug("Starting free games collection process")
         game_page = await browser.new_page()
+        for p in list(browser.pages):
+            if p is not game_page:
+                with suppress(Exception):
+                    await asyncio.wait_for(p.close(), timeout=5)
         agent = EpicAgent(game_page)
         if collect_summary:
             summary = await collect_epic_games_with_summary(agent)

@@ -87,16 +87,38 @@ def _browser_proxy_options() -> dict[str, str] | None:
 
 def _camoufox_launch_options(headless: bool | str, proxy: dict[str, str] | None) -> dict:
     from browserforge.fingerprints import Screen
+    from camoufox import DefaultAddons
+
+    user_data_dir = settings.user_data_dir_for("camoufox")
+    prefs_file = user_data_dir / "prefs.js"
+    if prefs_file.exists():
+        with suppress(Exception):
+            lines = [
+                line
+                for line in prefs_file.read_text(encoding="utf-8", errors="ignore").splitlines()
+                if "dom.ipc.processCount" not in line
+            ]
+            prefs_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     screen = Screen(max_width=1920, max_height=1080, min_height=1080, min_width=1920)
-    firefox_user_prefs = {"network.dns.disableIPv6": True, "network.trr.mode": 5}
+    firefox_user_prefs = {
+        "network.dns.disableIPv6": True,
+        "network.trr.mode": 5,
+        "media.autoplay.default": 5,
+        "media.autoplay.blocking_policy": 2,
+        "browser.cache.disk.enable": False,
+        "browser.cache.memory.capacity": 65536,
+        "browser.sessionhistory.max_total_viewers": 0,
+        "browser.sessionhistory.max_entries": 2,
+    }
     if proxy is None:
         firefox_user_prefs["network.proxy.type"] = 0
 
     options = {
         "persistent_context": True,
-        "user_data_dir": settings.user_data_dir_for("camoufox"),
+        "user_data_dir": user_data_dir,
         "screen": screen,
+        "exclude_addons": [DefaultAddons.UBO],
         "firefox_user_prefs": firefox_user_prefs,
         "humanize": False,
         "headless": headless,
@@ -153,6 +175,10 @@ async def _install_hsw_identity_route(context: BrowserContext) -> None:
     await context.route("**/hsw.js*", force_identity_encoding)
 
 
+async def _install_media_abort_route(context: BrowserContext) -> None:
+    await context.route("**/*.{mp4,webm,m3u8,mpd,ts,m4s}", lambda route: route.abort())
+
+
 @asynccontextmanager
 async def open_browser_context(headless: bool | str) -> AsyncIterator[BrowserContext]:
     install_playwright_frame_guard()
@@ -184,6 +210,7 @@ async def open_browser_context(headless: bool | str) -> AsyncIterator[BrowserCon
             )
         else:
             await _install_hsw_identity_route(browser)
+            await _install_media_abort_route(browser)
             logger.info(
                 "Browser backend active | backend=camoufox | headless_mode={} | proxy_enabled={}",
                 headless,

@@ -348,9 +348,16 @@ class EpicAgent:
             )
 
         self._namespaces = self._namespaces or [order.namespace for order in self._orders]
+        owned_offer_ids = {order.offerId for order in self._orders if order.offerId}
         all_promotions = get_promotions()
-        claimed_promotions = [p for p in all_promotions if p.namespace in self._namespaces]
-        self._promotions = [p for p in all_promotions if p.namespace not in self._namespaces]
+
+        def _is_owned(p: PromotionGame) -> bool:
+            if p.id:
+                return p.id in owned_offer_ids
+            return p.namespace in self._namespaces
+
+        claimed_promotions = [p for p in all_promotions if _is_owned(p)]
+        self._promotions = [p for p in all_promotions if not _is_owned(p)]
 
         for promotion in claimed_promotions:
             logger.success(
@@ -806,7 +813,7 @@ class EpicGames:
         safe_reason = reason.lower().replace(" ", "_")
         try:
             await page.screenshot(
-                path=target.joinpath(f"{safe_reason}-{stamp}.png"), full_page=True, timeout=5000
+                path=target.joinpath(f"{safe_reason}-{stamp}.png"), full_page=False, timeout=5000
             )
         except Exception as err:
             logger.warning(
@@ -862,12 +869,78 @@ class EpicGames:
             )
 
     @staticmethod
+    async def _click_cloudflare_turnstile(page: Page) -> bool:
+        frames = list(getattr(page, "frames", ()) or ())
+        for frame in frames:
+            if "challenges.cloudflare.com" not in (frame.url or "").lower():
+                continue
+            with suppress(Exception):
+                el = await frame.frame_element()
+                box = await el.bounding_box()
+                if box and box["width"] > 30 and box["height"] > 20:
+                    x = box["x"] + 28
+                    y = box["y"] + box["height"] / 2
+                    logger.info(
+                        "Clicking Cloudflare Turnstile iframe checkbox at ({:.1f}, {:.1f})", x, y
+                    )
+                    await page.mouse.click(x, y, delay=120)
+                    return True
+
+        # Closed Shadow DOM Turnstile fallback (e.g. .cf_challenge wrapper around cf-turnstile-response)
+        for container in [page, *frames]:
+            with suppress(Exception):
+                turnstile_input = container.locator("input[name='cf-turnstile-response']")
+                if await turnstile_input.count() > 0:
+                    wrapper = container.locator(".cf_challenge").first
+                    box = await wrapper.bounding_box()
+                    if box and box["width"] >= 200 and 40 <= box["height"] <= 120:
+                        widget_left = box["x"] + max(0.0, (box["width"] - 300.0) / 2.0)
+                        x = widget_left + 28.0
+                        y = box["y"] + box["height"] / 2.0
+                        logger.info(
+                            "Clicking Cloudflare Turnstile wrapper checkbox at ({:.1f}, {:.1f})",
+                            x,
+                            y,
+                        )
+                        await page.mouse.click(x, y, delay=120)
+                        return True
+        return False
+
+    @staticmethod
+    async def _clear_cloudflare_interstitial(page: Page, timeout_seconds: int = 25) -> bool:
+        deadline = time.monotonic() + timeout_seconds
+        clicked = False
+        while time.monotonic() < deadline:
+            has_cf = False
+            with suppress(Exception):
+                title = (await page.title() or "").lower()
+                has_cf = "just a moment" in title or await page.locator(
+                    ".cf_challenge_container"
+                ).first.is_visible()
+            if not has_cf and not any(
+                "challenges.cloudflare.com" in (f.url or "").lower() for f in page.frames
+            ):
+                if clicked:
+                    with suppress(Exception):
+                        await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                    await page.wait_for_timeout(3000)
+                return clicked
+
+            if await EpicGames._click_cloudflare_turnstile(page):
+                clicked = True
+                await page.wait_for_timeout(4500)
+            else:
+                await page.wait_for_timeout(1000)
+        return clicked
+
+    @staticmethod
     async def _goto_product_page(page: Page, url: str, title: str, attempts: int = 3) -> bool:
         for attempt in range(1, attempts + 1):
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=45000)
                 with suppress(Exception):
                     await page.wait_for_load_state("networkidle", timeout=8000)
+                await EpicGames._clear_cloudflare_interstitial(page, timeout_seconds=25)
                 return True
             except TimeoutError as err:
                 logger.warning(
@@ -1406,7 +1479,10 @@ class EpicGames:
             return True
 
         purchase_frame_text = await EpicGames._purchase_frame_text(page)
-        return any(marker in purchase_frame_text for marker in page_markers)
+        return any(marker in purchase_frame_text for marker in purchase_frame_markers) or any(
+            all(marker in purchase_frame_text for marker in markers)
+            for markers in purchase_frame_marker_pairs
+        )
 
     async def _resolve_checkout_security_check(
         self, page: Page, agent: AgentV, url: str, max_wait_ms: int = 600000
@@ -1423,6 +1499,39 @@ class EpicGames:
         while (time.monotonic() - started_at) * 1000 < max_wait_ms:
             attempt += 1
             await self._raise_if_free_game_rate_limited(page, url)
+
+            # If Talon error container with TRY AGAIN button is visible, click it to reload challenge
+            with suppress(Exception):
+                clicked_try_again = await page.evaluate(
+                    """() => {
+                        const btn = Array.from(document.querySelectorAll('button')).find(b =>
+                            (b.innerText || '').toUpperCase().includes('TRY AGAIN')
+                        );
+                        if (btn && btn.offsetParent !== null) {
+                            btn.click();
+                            return true;
+                        }
+                        return false;
+                    }"""
+                )
+                if clicked_try_again:
+                    logger.info(
+                        f"Clicked Talon 'TRY AGAIN' button to reload security challenge - {url=}"
+                    )
+                    await page.wait_for_timeout(3000)
+
+            # Handle Cloudflare Turnstile ("One more step" / Verify you are human) inside checkout
+            if await self._click_cloudflare_turnstile(page):
+                await page.wait_for_timeout(4500)
+                if not await self._is_checkout_security_check_visible(page):
+                    outcome = await self._observe_checkout_outcome(
+                        page, url, timeout_ms=min(15000, max_wait_ms)
+                    )
+                    if outcome in {"claimed", "checkout"}:
+                        logger.success(
+                            "Cloudflare Turnstile cleared in checkout into {} - {}", outcome, url
+                        )
+                        return True
 
             if await self._is_claimed_state(page, url):
                 logger.success(f"Checkout security check resolved into claimed state - {url=}")
@@ -2065,6 +2174,9 @@ class EpicGames:
         for promotion in promotions:
             url = promotion.url
             game_title = promotion.title
+            with suppress(Exception):
+                await page.goto("about:blank", timeout=5000)
+                await page.wait_for_timeout(300)
             if not await self._goto_product_page(page, url, game_title):
                 failed_urls.append(url)
                 continue
@@ -2095,9 +2207,11 @@ class EpicGames:
             try:
                 cta_visible = await purchase_btn.is_visible()
                 if not cta_visible:
+                    await self._clear_cloudflare_interstitial(page, timeout_seconds=20)
+                    purchase_btn = await self._find_purchase_cta(page)
                     # 慢速线路上 CTA 常常晚几秒才渲染出来，先给它一次机会再判定
                     with suppress(Exception):
-                        await purchase_btn.wait_for(state="visible", timeout=12000)
+                        await purchase_btn.wait_for(state="visible", timeout=20000)
                     cta_visible = await purchase_btn.is_visible()
                 if not cta_visible:
                     # 整页文本只能作为最后的兜底判据：

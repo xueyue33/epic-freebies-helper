@@ -172,6 +172,72 @@ def _point_inside_bounds(
     return x_min <= x <= x_max and y_min <= y <= y_max
 
 
+def _sanitize_point_answers(
+    points: list[Any],
+    *,
+    challenge_bbox: dict[str, float] | None,
+    clickable_bounds: tuple[float, float, float, float] | None,
+    clamp_margin: float = 30.0,
+) -> list[Any]:
+    """Sanitize and clamp model-returned points against challenge and grid bounds."""
+    if not points or challenge_bbox is None:
+        return points
+
+    challenge_bounds = (
+        float(challenge_bbox["x"]),
+        float(challenge_bbox["y"]),
+        float(challenge_bbox["x"]) + float(challenge_bbox["width"]),
+        float(challenge_bbox["y"]) + float(challenge_bbox["height"]),
+    )
+    target_bounds = clickable_bounds if clickable_bounds is not None else challenge_bounds
+    t_min_x, t_min_y, t_max_x, t_max_y = target_bounds
+
+    sanitized: list[Any] = []
+    for point in points:
+        px, py = float(point.x), float(point.y)
+        in_challenge = _point_inside_bounds((px, py), challenge_bounds)
+        dist_x = max(0.0, t_min_x - px, px - t_max_x)
+        dist_y = max(0.0, t_min_y - py, py - t_max_y)
+
+        if in_challenge and dist_x <= clamp_margin and dist_y <= clamp_margin:
+            clamped_x = min(max(px, t_min_x + 2.0), t_max_x - 2.0)
+            clamped_y = min(max(py, t_min_y + 2.0), t_max_y - 2.0)
+            if (clamped_x, clamped_y) != (px, py):
+                logger.info(
+                    "Clamped hCaptcha point from ({:.1f}, {:.1f}) to ({:.1f}, {:.1f})",
+                    px,
+                    py,
+                    clamped_x,
+                    clamped_y,
+                )
+            point.x = clamped_x
+            point.y = clamped_y
+            sanitized.append(point)
+        else:
+            logger.warning(
+                "Dropped outlier hCaptcha point ({:.1f}, {:.1f}) outside target bounds {}",
+                px,
+                py,
+                target_bounds,
+            )
+
+    if not sanitized and points:
+        first = points[0]
+        fx, fy = float(first.x), float(first.y)
+        first.x = min(max(fx, t_min_x + 5.0), t_max_x - 5.0)
+        first.y = min(max(fy, t_min_y + 5.0), t_max_y - 5.0)
+        logger.warning(
+            "All points were outliers; clamped fallback point from ({:.1f}, {:.1f}) to ({:.1f}, {:.1f})",
+            fx,
+            fy,
+            first.x,
+            first.y,
+        )
+        sanitized.append(first)
+
+    return sanitized
+
+
 def _build_point_prompt(
     user_prompt: str,
     *,
@@ -288,6 +354,27 @@ def _correct_drag_source_points(
         previous = (path.start_point.x, path.start_point.y)
         path.start_point.x, path.start_point.y = source
         logger.info("Corrected hCaptcha drag source from model={} to payload={}", previous, source)
+
+    if challenge_bbox:
+        min_x = float(challenge_bbox["x"]) + 2.0
+        min_y = float(challenge_bbox["y"]) + 2.0
+        max_x = float(challenge_bbox["x"]) + float(challenge_bbox["width"]) - 2.0
+        max_y = float(challenge_bbox["y"]) + float(challenge_bbox["height"]) - 2.0
+        for path in paths:
+            if hasattr(path, "end_point"):
+                ep = path.end_point
+                cx = min(max(float(ep.x), min_x), max_x)
+                cy = min(max(float(ep.y), min_y), max_y)
+                if (cx, cy) != (float(ep.x), float(ep.y)):
+                    logger.info(
+                        "Clamped hCaptcha drag target from ({:.1f}, {:.1f}) to ({:.1f}, {:.1f})",
+                        float(ep.x),
+                        float(ep.y),
+                        cx,
+                        cy,
+                    )
+                    ep.x = cx
+                    ep.y = cy
 
     return paths
 
@@ -712,21 +799,16 @@ def apply_hcaptcha_drag_patch() -> None:
                 )
                 logger.debug(f'[{cid+1}/{crumb_count}]ToolInvokeMessage: {response.log_message}')
 
-                validation_error = _point_answer_validation_error(
+                points_to_click = _sanitize_point_answers(
                     response.points,
                     challenge_bbox=challenge_bbox,
                     clickable_bounds=clickable_bounds,
                 )
-                if validation_error is not None:
-                    logger.warning(
-                        "Rejected unsafe hCaptcha point answer | reason={}", validation_error
-                    )
-                    raise ValueError(f"Unsafe hCaptcha point answer: {validation_error}")
 
                 self._spatial_point_reasoner.cache_response(
                     path=cache_key.joinpath(f"{cache_key.name}_{cid}_model_answer.json")
                 )
-                for point in response.points:
+                for point in points_to_click:
                     await self.page.mouse.click(point.x, point.y, delay=180)
                     await self.page.wait_for_timeout(500)
 

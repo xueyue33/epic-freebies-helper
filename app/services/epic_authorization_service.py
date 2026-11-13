@@ -26,6 +26,13 @@ from settings import SCREENSHOTS_DIR, settings
 
 URL_CLAIM = "https://store.epicgames.com/en-US/free-games"
 URL_ORDER_HISTORY = "https://www.epicgames.com/account/v2/payment/ajaxGetOrderHistory"
+# 商店「Sign in」按钮实际跳转的 SSO 端点；全新 profile 下商店页可能整页未渲染，
+# 无法点按钮时直接访问它，客户端 ID 取自该按钮链接。
+URL_STORE_SSO = (
+    "https://www.epicgames.com/id/login/switch-account?lang=en-US"
+    "&redirect_uri=https%3A%2F%2Fstore.epicgames.com%2Ffree-games%3Flang%3Den-US"
+    "&client_id=875a3b57d3a640a6b7f9b4e883463ab4"
+)
 
 
 class EpicAuthenticationFatalError(RuntimeError):
@@ -104,7 +111,11 @@ class EpicAuthorization:
         Returns:
 
         """
-        await self.page.goto("https://www.epicgames.com/account/personal", wait_until="networkidle")
+        await self.page.goto(
+            "https://www.epicgames.com/account/personal",
+            wait_until="domcontentloaded",
+            timeout=30000,
+        )
 
         btn_ids = ["#link-success", "#login-reminder-prompt-setup-tfa-skip", "#yes"]
 
@@ -300,15 +311,85 @@ class EpicAuthorization:
             )
         )
 
+    async def _is_in_viewport(self, locator) -> bool:
+        with suppress(Exception):
+            if not await locator.is_visible():
+                return False
+            box = await locator.bounding_box()
+            if not box:
+                return False
+            vp = self.page.viewport_size or {"width": 1920, "height": 1080}
+            return (
+                box["width"] > 0
+                and box["height"] > 0
+                and box["x"] + box["width"] > 0
+                and box["y"] + box["height"] > 0
+                and box["x"] < vp["width"]
+                and box["y"] < vp["height"]
+            )
+        return False
+
+    async def _is_already_logged_in_on_account_page(self) -> bool:
+        url = (self.page.url or "").lower()
+        if "/id/login" in url or "/id/register" in url:
+            return False
+        if "/account/personal" in url:
+            for selector in (
+                "text=Account information",
+                "text=Personal details",
+                "text=Display name",
+            ):
+                with suppress(Exception):
+                    if await self.page.locator(selector).first.is_visible(timeout=500):
+                        return True
+        return False
+
+    async def _wait_for_password_step(self, agent: AgentV, timeout_seconds: int = 25) -> None:
+        deadline = time.monotonic() + timeout_seconds
+        password_input = self.page.locator("#password")
+        email_captcha_attempted = False
+
+        while time.monotonic() < deadline:
+            if await self._is_in_viewport(password_input):
+                return
+
+            if not email_captcha_attempted and await self._has_visible_hcaptcha():
+                email_captcha_attempted = True
+                logger.info(
+                    "hCaptcha detected during email step; invoking solver before password input"
+                )
+                with suppress(Exception):
+                    await wait_for_challenge_signal(
+                        agent,
+                        context="login:email",
+                        timeout_seconds=(
+                            settings.EXECUTION_TIMEOUT + settings.RESPONSE_TIMEOUT + 5
+                        ),
+                    )
+                deadline = max(deadline, time.monotonic() + 12)
+                continue
+
+            await self.page.wait_for_timeout(300)
+
+        raise PlaywrightTimeoutError(
+            "Timed out waiting for Epic #password input to enter viewport"
+        )
+
     async def _wait_for_login_form(self, point_url: str) -> None:
         deadline = time.monotonic() + 45
         recovery_attempts = 0
         email_input = self.page.locator("#email")
+        password_input = self.page.locator("#password")
 
         while time.monotonic() < deadline:
-            with suppress(Exception):
-                await expect(email_input).to_be_visible(timeout=1000)
+            if await self._is_already_logged_in_on_account_page():
                 return
+
+            with suppress(Exception):
+                if await self._is_in_viewport(email_input) or await self._is_in_viewport(
+                    password_input
+                ):
+                    return
 
             if await self._has_pre_login_security_check():
                 if recovery_attempts < 2:
@@ -560,6 +641,10 @@ class EpicAuthorization:
                 continue
 
             if not self._is_mfa_page() and "/id/login" not in self.page.url:
+                if not self._is_refresh_csrf_signal.empty():
+                    return
+                if await self._is_already_logged_in_on_account_page():
+                    return
                 if "true" == await self._get_login_status(timeout_ms=500, warn_timeout=False):
                     return
 
@@ -569,10 +654,10 @@ class EpicAuthorization:
 
     async def _replace_page(self) -> None:
         old_page = self.page
-        self.page = await old_page.context.new_page()
+        self.page = await asyncio.wait_for(old_page.context.new_page(), timeout=15)
         self.page.on("response", self._on_response_anything)
         with suppress(Exception):
-            await old_page.close()
+            await asyncio.wait_for(old_page.close(), timeout=8)
 
     async def _resubmit_password_form(self) -> bool:
         password_input = self.page.locator("#password")
@@ -647,10 +732,62 @@ class EpicAuthorization:
             logger.warning("Failed to verify Epic account session via order history: {!r}", err)
             return False
 
+    async def _establish_store_session(self, timeout_seconds: int = 60) -> bool:
+        """全新 profile 只完成账号门户登录，商店 OAuth 未发起；走一次商店 SSO 端点补齐。"""
+        try:
+            await self.page.goto(URL_STORE_SSO, wait_until="domcontentloaded", timeout=45000)
+        except PlaywrightError as err:
+            logger.warning("Failed to open the Epic store SSO endpoint: {!r}", err)
+            return False
+
+        deadline = time.monotonic() + timeout_seconds
+        account_selected = False
+        while time.monotonic() < deadline:
+            url = self.page.url
+            if not account_selected and "switch-account" in url:
+                account_selected = True
+                if not await self._select_store_sign_in_account():
+                    return False
+                continue
+            if "store.epicgames.com" in url and await self._get_login_status(2000) == "true":
+                logger.success("Epic Store session established via the store SSO endpoint")
+                return True
+            await self.page.wait_for_timeout(1000)
+        logger.warning("Epic Store sign-in hand-off timed out | current_url='{}'", self.page.url)
+        return False
+
+    async def _select_store_sign_in_account(self) -> bool:
+        """在 switch-account 页点选已记录账号；该页渲染较慢，先等账号行出现。"""
+        with suppress(Exception):
+            await self.page.locator(".MuiSkeleton-root").first.wait_for(
+                state="detached", timeout=8000
+            )
+        rows = self.page.get_by_role("button").filter(has_text="@")
+        try:
+            for _ in range(20):
+                if await rows.count():
+                    break
+                await self.page.wait_for_timeout(1000)
+            count = await rows.count()
+            if count == 0:
+                logger.warning("Store sign-in chooser exposed no account row")
+                return False
+            if count > 1:
+                domain = (settings.EPIC_EMAIL or "").rsplit("@", 1)[-1].strip()
+                narrowed = rows.filter(has_text=domain) if domain else rows
+                rows = narrowed if await narrowed.count() >= 1 else rows
+            await rows.first.click(timeout=10000, no_wait_after=True)
+            logger.info("Selected the remembered account on the store sign-in chooser")
+            return True
+        except PlaywrightError as err:
+            logger.warning("Failed to select the Epic account on the sign-in chooser: {!r}", err)
+            return False
+
     async def _ensure_store_session_ready(self, timeout_seconds: int = 45) -> None:
         deadline = time.monotonic() + timeout_seconds
         account_probe_at = time.monotonic() + 8
         account_probe_attempted = False
+        store_handoff_attempted = False
 
         while time.monotonic() < deadline:
             if self._needs_privacy_policy_correction():
@@ -670,6 +807,11 @@ class EpicAuthorization:
             if status == "true":
                 return
             if status == "false":
+                if not store_handoff_attempted:
+                    store_handoff_attempted = True
+                    remaining = max(20, int(deadline - time.monotonic()))
+                    if await self._establish_store_session(timeout_seconds=remaining):
+                        return
                 raise RuntimeError(
                     "Epic store still reports isloggedin=false after authentication. "
                     f"current_url={self.page.url}"
@@ -677,6 +819,10 @@ class EpicAuthorization:
 
             if not account_probe_attempted and time.monotonic() >= account_probe_at:
                 account_probe_attempted = True
+                if not store_handoff_attempted:
+                    store_handoff_attempted = True
+                    if await self._establish_store_session(timeout_seconds=25):
+                        return
                 logger.warning(
                     "Epic navigation login marker did not appear after authentication; "
                     "probing account session via order history."
@@ -714,15 +860,33 @@ class EpicAuthorization:
             await self.page.goto(point_url, wait_until="domcontentloaded")
             await self._wait_for_login_form(point_url)
 
-            # 1. 使用电子邮件地址登录（若持久化 Profile 已记住邮箱且设为 readonly，直接填密码）
+            if await self._is_already_logged_in_on_account_page():
+                logger.success("Active session confirmed on account page; skipping login form")
+                await self._goto_claim_page()
+                await self._ensure_store_session_ready()
+                return True
+
+            # 1. 使用电子邮件地址登录
+            # 注意：Epic 登录页第一步会在屏幕外 (x=-9590) 预渲染隐藏的 #password 供密码管理器嗅探，
+            # Playwright 的 is_visible() 会误判为 True，必须用视口坐标 (_is_in_viewport) 判断！
             email_input = self.page.locator("#email")
             password_input = self.page.locator("#password")
-            if not await password_input.is_visible() and await email_input.is_editable():
-                await email_input.fill(settings.EPIC_EMAIL)
-                await self.page.click("#continue")
+            continue_button = self.page.locator("#continue")
+            if not await self._is_in_viewport(password_input) or await self._is_in_viewport(
+                continue_button
+            ):
+                if await self._is_in_viewport(email_input):
+                    for _ in range(10):
+                        if await email_input.is_editable():
+                            break
+                        await self.page.wait_for_timeout(300)
+                    if await email_input.is_editable():
+                        await email_input.fill(settings.EPIC_EMAIL)
+                if await self._is_in_viewport(continue_button):
+                    await continue_button.click(timeout=15000)
 
             # 3. 输入密码
-            await expect(password_input).to_be_visible(timeout=10000)
+            await self._wait_for_password_step(agent, timeout_seconds=60)
             await password_input.fill(settings.EPIC_PASSWORD.get_secret_value())
 
             # 4. 点击登录按钮，触发人机挑战值守监听器
@@ -745,7 +909,7 @@ class EpicAuthorization:
                     pass
 
                 try:
-                    await self._await_login_outcome(point_url, agent, timeout_seconds=25)
+                    await self._await_login_outcome(point_url, agent, timeout_seconds=60)
                     login_confirmed = True
                     break
                 except PlaywrightTimeoutError:
@@ -820,6 +984,9 @@ class EpicAuthorization:
         max_attempts = settings.AUTH_MAX_ATTEMPTS
         for attempt in range(1, max_attempts + 1):
             if await self._has_account_session():
+                await self._goto_claim_page()
+                with suppress(Exception):
+                    await self._ensure_store_session_ready(timeout_seconds=30)
                 logger.success("Epic Games is already logged in")
                 return True
 
@@ -852,12 +1019,13 @@ class EpicAuthorization:
 
             if attempt < max_attempts:
                 logger.warning(
-                    "Authentication attempt {}/{} failed; resetting page state before retry",
+                    "Authentication attempt {}/{} failed; replacing page before retry",
                     attempt,
                     max_attempts,
                 )
-                with suppress(Exception):
-                    await self.page.context.clear_cookies()
+                if attempt == max_attempts - 1:
+                    with suppress(Exception):
+                        await self.page.context.clear_cookies()
                 await self._replace_page()
 
         logger.error("Epic Games authentication failed after {} attempts", max_attempts)
